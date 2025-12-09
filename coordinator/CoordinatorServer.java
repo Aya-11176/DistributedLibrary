@@ -1,35 +1,33 @@
-// CoordinatorServer.java
 import java.io.*;
 import java.net.*;
 import java.util.*;
 import java.util.concurrent.*;
 
 public class CoordinatorServer {
-
-    private static final int CLIENT_PORT = 5000;
-    private List<ServerInfo> libraryServers = new ArrayList<>();
+    private static final int CLIENT_PORT = 8081;
+    private final List<ServerInfo> libraryServers = new ArrayList<>();
 
     public CoordinatorServer() {
-        libraryServers.add(new ServerInfo("127.0.0.1", 6001));
-        libraryServers.add(new ServerInfo("127.0.0.1", 6002));
+        libraryServers.add(new ServerInfo("127.0.0.1", 9001));
+        libraryServers.add(new ServerInfo("127.0.0.1", 9002));
+        libraryServers.add(new ServerInfo("127.0.0.1", 9003));
     }
 
     static class ServerInfo {
-        String ip;
-        int port;
+        final String ip;
+        final int port;
         ServerInfo(String ip, int port) { this.ip = ip; this.port = port; }
         public String toString() { return ip + ":" + port; }
     }
 
     public void start() throws IOException {
-        ServerSocket serverSocket = new ServerSocket(CLIENT_PORT);
-        System.out.println("Coordinateur en écoute sur le port " + CLIENT_PORT);
-
-        ExecutorService clientPool = Executors.newFixedThreadPool(10);
-
-        while (true) {
-            Socket clientSocket = serverSocket.accept();
-            clientPool.submit(() -> handleClient(clientSocket));
+        try (ServerSocket serverSocket = new ServerSocket(CLIENT_PORT)) {
+            System.out.println("Coordinator listening on port " + CLIENT_PORT);
+            ExecutorService pool = Executors.newCachedThreadPool();
+            while (true) {
+                Socket client = serverSocket.accept();
+                pool.submit(() -> handleClient(client));
+            }
         }
     }
 
@@ -37,93 +35,148 @@ public class CoordinatorServer {
         try (BufferedReader in = new BufferedReader(new InputStreamReader(clientSocket.getInputStream()));
              PrintWriter out = new PrintWriter(clientSocket.getOutputStream(), true)) {
 
-            String line;
-            while ((line = in.readLine()) != null) {
-                if (line.startsWith("search ")) {
-                    List<String> results = broadcastSearch(line.substring(7));
-                    out.println("Results: " + results);
+            String request;
+            while ((request = in.readLine()) != null) {
+                if (request.trim().isEmpty()) continue;
+                String cmd = request.split(" ")[0].toLowerCase();
 
-                } else if (line.startsWith("lease ")) {
-                    String bookId = line.substring(6);
-                    String response = forwardRequest(bookId, "lease");
-                    out.println(response);
+                switch (cmd) {
+                    case "search":
+                        String keyword = request.length() > 7 ? request.substring(7) : "";
+                        List<String> results = broadcastSearch(keyword);
+                        if (results.isEmpty()) out.println("No results");
+                        else results.forEach(out::println);
+                        out.println("END_OF_RESPONSE");
+                        break;
 
-                } else if (line.startsWith("return ")) {
-                    String bookId = line.substring(7);
-                    String response = forwardRequest(bookId, "return");
-                    out.println(response);
+                    case "lease":
+                        String leaseId = request.length() > 6 ? request.substring(6).trim() : "";
+                        out.println(forwardRequest(leaseId, "LEASE"));
+                        out.println("END_OF_RESPONSE");
+                        break;
 
-                } else if (line.equals("stats")) {
-                    Map<String, Integer> stats = collectStats();
-                    out.println("Stats: " + stats);
+                    case "return":
+                        String returnId = request.length() > 7 ? request.substring(7).trim() : "";
+                        out.println(forwardRequest(returnId, "RETURN"));
+                        out.println("END_OF_RESPONSE");
+                        break;
 
-                } else if (line.equals("quit")) {
-                    out.println("Goodbye!");
-                    break;
+                    case "stats":
+                        Map<String, Integer> stats = collectStats();
+                        out.println("Stats aggregated: " + stats.toString());
+                        out.println("END_OF_RESPONSE");
+                        break;
 
-                } else {
-                    out.println("Unknown command");
+                    case "list":
+                        List<String> lists = collectList();
+                        if (lists.isEmpty()) out.println("No books reported");
+                        else lists.forEach(out::println);
+                        out.println("END_OF_RESPONSE");
+                        break;
+
+                    case "quit":
+                        out.println("Goodbye!");
+                        out.println("END_OF_RESPONSE");
+                        return;
+
+                    default:
+                        out.println("Unknown command");
+                        out.println("END_OF_RESPONSE");
+                        break;
                 }
             }
 
         } catch (IOException e) {
-            System.out.println("Client error: " + e.getMessage());
+            System.out.println("Coordinator client handler error: " + e.getMessage());
         }
     }
 
     private List<String> broadcastSearch(String keyword) {
-        List<String> mergedResults = new ArrayList<>();
-        for (ServerInfo server : libraryServers) {
-            try (Socket socket = new Socket(server.ip, server.port);
-                 BufferedReader in = new BufferedReader(new InputStreamReader(socket.getInputStream()));
-                 PrintWriter out = new PrintWriter(socket.getOutputStream(), true)) {
-
-                out.println("search " + keyword);
-                String response = in.readLine();
-                if (response != null) mergedResults.add(response);
-
+        List<String> merged = new ArrayList<>();
+        for (ServerInfo s : libraryServers) {
+            try (Socket sock = new Socket(s.ip, s.port);
+                 PrintWriter out = new PrintWriter(sock.getOutputStream(), true);
+                 BufferedReader in = new BufferedReader(new InputStreamReader(sock.getInputStream()))
+            ) {
+                out.println("SEARCH " + keyword);
+                String line;
+                while ((line = in.readLine()) != null) {
+                    if (line.equals("END_OF_RESPONSE")) break;
+                    merged.add(s + " -> " + line);
+                }
             } catch (IOException e) {
-                System.out.println("Server " + server + " unreachable.");
+                merged.add(s + " -> unreachable");
             }
         }
-        return mergedResults;
+        return merged;
     }
 
     private String forwardRequest(String bookId, String command) {
-        for (ServerInfo server : libraryServers) {
-            try (Socket socket = new Socket(server.ip, server.port);
-                 BufferedReader in = new BufferedReader(new InputStreamReader(socket.getInputStream()));
-                 PrintWriter out = new PrintWriter(socket.getOutputStream(), true)) {
-
+        for (ServerInfo s : libraryServers) {
+            try (Socket sock = new Socket(s.ip, s.port);
+                 PrintWriter out = new PrintWriter(sock.getOutputStream(), true);
+                 BufferedReader in = new BufferedReader(new InputStreamReader(sock.getInputStream()))
+            ) {
                 out.println(command + " " + bookId);
-                return in.readLine();
-
-            } catch (IOException e) {
-                // try next server
-            }
+                StringBuilder sb = new StringBuilder();
+                String line;
+                while ((line = in.readLine()) != null) {
+                    if (line.equals("END_OF_RESPONSE")) break;
+                    sb.append(line).append(" ");
+                }
+                String resp = sb.toString().trim();
+                if (!resp.isEmpty()) return s + " -> " + resp;
+            } catch (IOException ignored) {}
         }
         return "Failed: no server available for book " + bookId;
     }
 
     private Map<String, Integer> collectStats() {
-        Map<String, Integer> totalStats = new HashMap<>();
-        for (ServerInfo server : libraryServers) {
-            try (Socket socket = new Socket(server.ip, server.port);
-                 BufferedReader in = new BufferedReader(new InputStreamReader(socket.getInputStream()));
-                 PrintWriter out = new PrintWriter(socket.getOutputStream(), true)) {
-
-                out.println("stats");
-                String response = in.readLine();
-                if (response != null) {
-                    for (String s : response.split(",")) {
-                        String[] parts = s.split(":");
-                        totalStats.put(parts[0], totalStats.getOrDefault(parts[0], 0) + Integer.parseInt(parts[1]));
+        Map<String, Integer> total = new HashMap<>();
+        for (ServerInfo s : libraryServers) {
+            try (Socket sock = new Socket(s.ip, s.port);
+                 PrintWriter out = new PrintWriter(sock.getOutputStream(), true);
+                 BufferedReader in = new BufferedReader(new InputStreamReader(sock.getInputStream()))
+            ) {
+                out.println("STATS");
+                String line;
+                while ((line = in.readLine()) != null) {
+                    if (line.equals("END_OF_RESPONSE")) break;
+                    if (line.startsWith("STATS")) {
+                        String[] parts = line.substring(6).trim().split("\\s+");
+                        for (String p : parts) {
+                            String[] kv = p.split("=");
+                            if (kv.length == 2) {
+                                String key = kv[0].trim();
+                                int val = Integer.parseInt(kv[1].trim());
+                                total.put(key, total.getOrDefault(key, 0) + val);
+                            }
+                        }
                     }
                 }
-
-            } catch (IOException e) {}
+            } catch (IOException ignored) {}
         }
-        return totalStats;
+        return total;
+    }
+
+    private List<String> collectList() {
+        List<String> list = new ArrayList<>();
+        for (ServerInfo s : libraryServers) {
+            try (Socket sock = new Socket(s.ip, s.port);
+                 PrintWriter out = new PrintWriter(sock.getOutputStream(), true);
+                 BufferedReader in = new BufferedReader(new InputStreamReader(sock.getInputStream()))
+            ) {
+                out.println("LIST");
+                String line;
+                while ((line = in.readLine()) != null) {
+                    if (line.equals("END_OF_RESPONSE")) break;
+                    list.add(s + " -> " + line);
+                }
+            } catch (IOException e) {
+                list.add(s + " -> unreachable");
+            }
+        }
+        return list;
     }
 
     public static void main(String[] args) throws IOException {
