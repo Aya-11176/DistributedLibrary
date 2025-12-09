@@ -21,53 +21,76 @@ public class LibraryServer {
 
             while (true) {
                 Socket socket = server.accept();
+                System.out.println("Client connected: " + socket.getRemoteSocketAddress());
+
+                // Handle multiple commands per client
                 BufferedReader in = new BufferedReader(new InputStreamReader(socket.getInputStream()));
                 PrintWriter out = new PrintWriter(socket.getOutputStream(), true);
 
-                String request = in.readLine();
-                if (request == null) { socket.close(); continue; }
+                String request;
+                while ((request = in.readLine()) != null) {
+                    if (request.trim().isEmpty()) continue;
 
-                String[] parts = request.split(" ", 2);
-                String command = parts[0].toUpperCase();
+                    String[] parts = request.split(" ", 2);
+                    String command = parts[0].toUpperCase();
 
-                switch (command) {
-                    case "SEARCH":
-                        String keyword = parts.length > 1 ? parts[1] : "";
-                        stats.recordSearch(keyword);
-                        List<Book> results = db.search(keyword);
-                        if (results.isEmpty()) out.println("NOT_FOUND");
-                        else {
-                            for (Book b : results) {
+                    switch (command) {
+                        case "SEARCH":
+                            String keyword = parts.length > 1 ? parts[1] : "";
+                            stats.recordSearch(keyword);
+                            List<Book> results = db.search(keyword);
+                            if (results.isEmpty()) out.println("NOT_FOUND");
+                            else {
+                                for (Book b : results) {
+                                    String safeTitle = b.title.replace(" ", "_");
+                                    String status = b.available ? "available" : "not_available";
+                                    out.println("FOUND " + b.id + " " + safeTitle + " " + status);
+                                }
+                            }
+                            break;
+
+                        case "LEASE":
+                            try {
+                                int id = Integer.parseInt(parts[1]);
+                                if (db.lease(id)) { stats.recordLease(); out.println("LEASED"); }
+                                else out.println("UNAVAILABLE");
+                            } catch (Exception e) {
+                                out.println("INVALID_COMMAND");
+                            }
+                            break;
+
+                        case "RETURN":
+                            try {
+                                int idr = Integer.parseInt(parts[1]);
+                                if (db.returnBook(idr)) { stats.recordReturn(); out.println("RETURNED"); }
+                                else out.println("UNAVAILABLE");
+                            } catch (Exception e) {
+                                out.println("INVALID_COMMAND");
+                            }
+                            break;
+
+                        case "STATS":
+                            out.println(stats.getSummary());
+                            break;
+
+                        case "LIST":
+                            List<Book> allBooks = db.search(""); // empty keyword returns all books
+                            for (Book b : allBooks) {
                                 String safeTitle = b.title.replace(" ", "_");
                                 String status = b.available ? "available" : "not_available";
-                                out.println("FOUND " + b.id + " " + safeTitle + " " + status);
+                                out.println(b.id + " " + safeTitle + " " + status);
                             }
-                        }
-                        break;
+                            break;
 
-                    case "LEASE":
-                        int id = Integer.parseInt(parts[1]);
-                        if (db.lease(id)) { stats.recordLease(); out.println("LEASED"); }
-                        else out.println("UNAVAILABLE");
-                        break;
+                        case "QUIT":
+                            out.println("Goodbye!");
+                            socket.close();
+                            break;
 
-                    case "RETURN":
-                        int idr = Integer.parseInt(parts[1]);
-                        if (db.returnBook(idr)) { stats.recordReturn(); out.println("RETURNED"); }
-                        else out.println("UNAVAILABLE");
-                        break;
-
-                    case "STATS":
-                        int total = db.countTotal();
-                        int available = db.countAvailable();
-                        int leased = total - available;
-                        out.println("STATS total=" + total + " available=" + available + " leased=" + leased);
-                        break;
-
-                    default:
-                        out.println("INVALID_COMMAND");
+                        default:
+                            out.println("INVALID_COMMAND");
+                    }
                 }
-                socket.close();
             }
 
         } catch (Exception e) {
